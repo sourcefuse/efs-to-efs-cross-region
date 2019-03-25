@@ -1,0 +1,624 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: EFS-to-EFS Backup Solution Cross Region template
+
+Parameters:
+  # Source EFS on which restore will be performed
+  SrcEFS:
+    Description: Source EFS Id
+    Type: String
+  
+  DstEFS:
+    Description: Destination EFS Id
+    Type: String
+  
+  SrcEFSPrivateIp:
+    Description: Source EFS Private IP with suffix. Example 10.0.0.1:/
+    Type: String
+  
+  DstEFSPrivateIp:
+    Description: Destination EFS Private IP with suffix. Example 10.0.0.2:/
+    Type: String  
+
+  # Interval tag for your backups; daily, weekly, monthly
+  IntervalTag:
+    Description: Interval label to identify backups
+    Type: String
+    Default: daily
+    AllowedValues:
+      - daily
+      - weekly
+      - monthly
+
+  # Number of backups you want to retain
+  Retain:
+    Description: Backups you want to retain
+    Type: Number
+    Default: 7
+
+  # Folder identifier where backup will be stored
+  FolderLabel:
+    Description: Folder for your backups
+    Type: String
+    Default: efs-backup
+
+  # Backup window for which backup will run
+  BackupWindow:
+    Description: Backup window duration in minutes
+    Type: Number
+    Default: 180
+    ConstraintDescription: must specify backup window in minutes
+    AllowedValues:
+    - 60
+    - 90
+    - 120
+    - 150
+    - 180
+    - 240
+    - 300
+    - 360
+    - 480
+    - 600
+    - 720
+    - 840
+    - 960
+    - 1080
+    - 1200
+    - 1320
+
+  # Schedule for the backup, cron(0 2 * * ? *)
+  BackupSchedule:
+    Description: Schedule for running backup
+    Type: String
+    Default: cron(0 2 * * ? *)
+    ConstraintDescription: No frequent than daily backup
+
+  # If customer wants notification for successful backups
+  SuccessNotification:
+    Description: Do you want to be notified for successful backups? *for failure, you will always be notified
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "Yes"
+
+  # VPCId for the EFS
+  VpcId:
+    Description: VPC where the source EFS has mount targets
+    Type: AWS::EC2::VPC::Id
+
+  # List of SubnetIDs for EC2, must be same AZ as of EFS Mount Targets (Choose 2)
+  Subnets:
+    Description: List of SubnetIDs for EC2, must be same AZ as of EFS Mount Targets(Choose 2)
+    Type: List<AWS::EC2::Subnet::Id>
+    ConstraintDescription: must specify subnets in different AZs
+
+  # Email for notifications
+  Email:
+    Description: Email for backup notifications
+    Type: String
+
+  # CW Dashboard
+  Dashboard:
+    Description: Do you want dashoard for your metrics?
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "Yes"
+  
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Backup Configuration
+        Parameters:
+          - SrcEFS
+          - SrcEFSPrivateIp
+          - DstEFSPrivateIp
+          - DstEFS
+          - IntervalTag
+          - Retain
+          - FolderLabel
+          - BackupWindow
+          - BackupSchedule
+          - BackupPrefix
+      - Label:
+          default: EC2 Configuration
+        Parameters:
+          - VpcId
+          - Subnets
+      - Label:
+          default: Notification & Dashboard
+        Parameters:
+          - SuccessNotification
+          - Email
+          - Dashboard
+    ParameterLabels:
+      IntervalTag:
+        default: Interval Label
+      Subnets:
+        default: Subnet IDs
+      SrcEFS:
+        default: Source EFS
+      SrcEFSPrivateIp:
+        default: Source EFS Private IP
+      DstEFSPrivateIp:
+        default: Destination EFS Private IP    
+      FolderLabel:
+        default: Folder Label
+      BackupWindow:
+        default: Backup Window
+      BackupSchedule:
+        default: Backup Schedule
+      SuccessNotification:
+        default: Success Notification
+      VpcId:
+        default: VPC ID
+      EFSEncryption:
+        default: EFS Encryption    
+
+Mappings:
+  Map:
+    encryption: {"Yes": "true", "No": "false"}
+    send-data: {"SendAnonymousData": "Yes"}
+    c5.xlarge: {"Arch":"HVM64"}
+    us-east-1: {"InstanceSize":"c5.xlarge"}
+    us-east-2: {"InstanceSize":"c5.xlarge"}
+    us-west-1: {"InstanceSize":"c5.xlarge"}
+    us-west-2: {"InstanceSize":"c5.xlarge"}
+    ca-central-1: {"InstanceSize":"c5.xlarge"}
+    eu-west-1: {"InstanceSize":"c5.xlarge"}
+    eu-central-1: {"InstanceSize":"c5.xlarge"}
+    eu-west-2: {"InstanceSize":"c5.xlarge"}
+    ap-southeast-1: {"InstanceSize":"c5.xlarge"}
+    ap-southeast-2: {"InstanceSize":"c5.xlarge"}
+    ap-northeast-1: {"InstanceSize":"c5.xlarge"}
+    ap-northeast-2: {"InstanceSize":"c5.xlarge"}
+    ap-south-1: {"InstanceSize":"c5.xlarge"}
+    sa-east-1: {"InstanceSize":"c5.xlarge"}
+
+Conditions:
+  DashboardOpt: !Equals [ !Ref Dashboard, "Yes" ]
+
+Resources:
+  #
+  # EFS resources
+  # [EFSSecurityGroup, EFSIngressRule, DstEFS, MountTarget0, MountTarget1]
+  #
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F1000
+            reason: "allowing all egress traffic"
+    Properties:
+      VpcId: !Sub ${VpcId}
+      GroupDescription: !Sub SG for EFS backup solution ${AWS::StackName}
+
+  EFSIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      FromPort: -1
+      GroupId: !Sub ${EFSSecurityGroup}
+      IpProtocol: -1
+      SourceSecurityGroupId: !Sub ${EFSSecurityGroup}
+      SourceSecurityGroupOwnerId: String
+      ToPort: -1
+
+  #
+  # EC2 resources
+  # [BackupInstanceLaunchConfig, EFSAutoScalingGroup, LifecycleHook]
+  #
+  BackupInstanceLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !GetAtt AMIInfo.Id
+      SecurityGroups:
+        - !Sub ${EFSSecurityGroup}
+      InstanceType: !FindInMap [Map, !Ref "AWS::Region", "InstanceSize"]
+      IamInstanceProfile: !Sub ${InstanceProfile}
+      UserData:
+        # download and run efs-backup script
+        # 12/28/2018 - EFS-21432 - adding retries for downloads
+          Fn::Base64: !Sub |
+           #!/bin/bash
+           # sudo yum install amazon-ssm-agent -y
+           sudo yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+           sudo start amazon-ssm-agent
+           
+           # SIM:V4488716 - 08/03/2018 - Support custom DHCP option
+           # https://github.com/awslabs/efs-backup/issues/1
+           cat <<EOT | sudo tee /etc/resolv.conf
+           search amazonaws.com
+           nameserver 169.254.169.253
+           EOT
+           
+           curl --connect-timeout 5 --speed-time 5 --retry 10  --retry-delay 5 https://s3.amazonaws.com/backup-utility-script/efs-backup-fpsync-m.sh -o /home/ec2-user/efs-backup-fpsync.sh
+
+           chmod a+x /home/ec2-user/efs-backup-fpsync.sh
+
+           /home/ec2-user/efs-backup-fpsync.sh ${SrcEFSPrivateIp} ${DstEFSPrivateIp} ${IntervalTag} ${Retain} ${FolderLabel}
+
+  EFSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchConfigurationName: !Sub ${BackupInstanceLaunchConfig}
+      MinSize: 0
+      DesiredCapacity: 0
+      MaxSize: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-instance
+          PropagateAtLaunch : true
+
+  LifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      AutoScalingGroupName: !Sub ${EFSAutoScalingGroup}
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+      HeartbeatTimeout: 3600
+
+  #
+  # Serverless resources
+  # [Orchestrator, EFSDynamoDB, EFSLogBucket]
+  #
+  Orchestrator:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}
+      Description: EFS Backup - Lambda function to create EFS backups
+      Environment:
+        Variables:
+          instance_type: !FindInMap [Map, !Ref "AWS::Region", "InstanceSize"]
+          autoscaling_group_name: !Sub ${EFSAutoScalingGroup}
+          source_efs: !Sub ${SrcEFS}
+          destination_efs: !Sub ${DstEFS}
+          backup_prefix: "NA"
+          folder_label: !Sub ${FolderLabel}
+          table_name: !Sub ${EFSDynamoDB}
+          backup_window_period: !Sub ${BackupWindow}
+          backup_retention_copies: !Sub ${Retain}
+          interval_tag: !Sub ${IntervalTag}
+          s3_bucket: !Sub ${EFSLogBucket}
+          topic_arn: !Sub ${SNSTopic}
+          uuid: !Sub ${CreateUniqueID.UUID}
+          send_anonymous_data: !FindInMap [Map, send-data, SendAnonymousData]
+          notification_on_success: !Sub ${SuccessNotification}
+          cw_dashboard: !Sub ${Dashboard}
+          efs_mode: "NA"
+      Handler: orchestrator.lambda_handler
+      Role: !Sub ${OrchestratorRole.Arn}
+      Code:
+        S3Bucket: !Sub solutions-${AWS::Region}
+        S3Key: efs-backup/v1.3.1/efs_to_efs_backup.zip
+      Runtime: python2.7
+      Timeout: 300
+
+  EFSDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+        SSESpecification:
+          SSEEnabled: true
+        AttributeDefinitions:
+          - AttributeName: BackupId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: BackupId
+            KeyType: HASH
+        # 12/28/2018 - EFS-21432 - DynamoDB on-demand capacity    
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: ExpireItem
+          Enabled: true
+        TableName: !Sub ${AWS::StackName}
+
+  EFSLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Retain
+
+
+  #
+  # Cloudwatch events/rule resources
+  # [EFSBackupStartEvent, BackupStartEventLambdaPermission, ASGEvent, ASGEventLambdaPermission]
+  #
+  EFSBackupStartEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule to run EFS backup
+      ScheduleExpression: !Sub ${BackupSchedule}
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${Orchestrator.Arn}
+          Id: OrchestratorEvent1
+          Input: "{\"mode\" : \"backup\" , \"action\": \"start\"}"
+
+  BackupStartEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub ${Orchestrator}
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub ${EFSBackupStartEvent.Arn}
+
+  ASGEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule to catch ASG Events
+      EventPattern:
+        source:
+          - aws.autoscaling
+        detail-type:
+          - EC2 Instance-terminate Lifecycle Action
+          - EC2 Instance Terminate Successful
+        detail:
+          AutoScalingGroupName:
+            - !Sub ${EFSAutoScalingGroup}
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${Orchestrator.Arn}
+          Id: OrchestratorEvent1
+
+  ASGEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub ${Orchestrator}
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub ${ASGEvent.Arn}
+
+
+  #
+  # Dashboard and Notification resources
+  # [CWDashboard, SNSTopic]
+  #
+  CWDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: DashboardOpt
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-${AWS::Region}
+      DashboardBody: !Sub '{"widgets":[{"type":"metric","x":0,"y":0,"width":18,"height":3,"properties":{"view":"singleValue","stacked":true,"metrics":[["AWS/EFS","BurstCreditBalance","FileSystemId","${SrcEFS}",{"stat":"Minimum"}],[".","PermittedThroughput",".","."],[".","TotalIOBytes",".",".",{"period":60,"stat":"Sum"}]],"region":"${AWS::Region}","title":"BurstCreditBalance, PermittedThroughput, TotalIOBytes - Source","period":300}},{"type":"metric","x":0,"y":3,"width":18,"height":3,"properties":{"view":"singleValue","stacked":false,"region":"${AWS::Region}","metrics":[["AWS/EFS","BurstCreditBalance","FileSystemId","${DstEFS}",{"period":60,"stat":"Average"}],[".","PermittedThroughput",".",".",{"period":60,"stat":"Average"}],[".","TotalIOBytes",".",".",{"period":60,"stat":"Sum"}]],"title":"BurstCreditBalance, PermittedThroughput, TotalIOBytes - Backup","period":300}},{"type":"metric","x":0,"y":6,"width":9,"height":6,"properties":{"view":"timeSeries","stacked":false,"metrics":[["AWS/Lambda","Errors","FunctionName","${Orchestrator}",{"stat":"Sum"}],[".","Invocations",".",".",{"stat":"Sum"}]],"region":"${AWS::Region}","period":300,"title":"Orchestrator"}},{"type":"metric","x":9,"y":6,"width":9,"height":6,"properties":{"view":"timeSeries","stacked":false,"metrics":[["AWS/DynamoDB","SuccessfulRequestLatency","TableName","${EFSDynamoDB}","Operation","UpdateItem",{"stat":"Sum"}],["...","PutItem",{"stat":"Sum"}]],"region":"${AWS::Region}","title":"Backup Table"}}]}'
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Protocol: email
+        Endpoint: !Sub ${Email}
+
+
+  #
+  # IAM resources
+  # [OrchestratorRole, EC2Role, EC2RolePolicies, InstanceProfile]
+  #
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: !Sub Orchestrator-Policy-${AWS::StackName}-${AWS::Region}
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action:
+            - autoscaling:UpdateAutoScalingGroup
+            Resource:
+            - !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${EFSAutoScalingGroup}
+          - Effect: Allow
+            Action:
+            - cloudwatch:GetMetricStatistics # resource level permission not allowed
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - elasticfilesystem:DescribeFileSystems
+            Resource:
+            - !Sub arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${SrcEFS}
+            - !Sub arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${DstEFS}
+          - Effect: Allow
+            Action:
+            - events:DeleteRule
+            - events:ListTargetsByRule
+            - events:PutRule
+            - events:PutTargets
+            - events:RemoveTargets
+            Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${EFSDynamoDB}
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSTopic.TopicName}
+          - Effect: Allow
+            Action:
+            - lambda:AddPermission
+            - lambda:GetFunction
+            - lambda:RemovePermission
+            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:* # cannot mention Orchestrator lambda, as that will cause cyclic dependency
+          - Effect: Allow
+            Action:
+            - ssm:SendCommand
+            Resource:
+            - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            - !Sub arn:aws:ssm:*:*:document/AWS-RunShellScript
+            - !Sub arn:aws:s3:::${EFSLogBucket}/*
+
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  EC2RolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-${AWS::Region}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - autoscaling:CompleteLifecycleAction
+          - autoscaling:SetDesiredCapacity
+          Resource:
+          - !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${EFSAutoScalingGroup}
+          - !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${BackupInstanceLaunchConfig}
+        - Effect: Allow
+          Action:
+          - dynamodb:UpdateItem
+          Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${EFSDynamoDB}
+        - Effect: Allow
+          Action:
+          - cloudwatch:GetMetricStatistics # resource level permission not allowed
+          Resource: '*'
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource: !Sub arn:aws:s3:::${EFSLogBucket}/*
+        - Effect: Allow
+          Action:
+          - ec2:DescribeTags
+          Resource: '*'
+      Roles:
+      - !Sub ${EC2Role}
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Sub ${EC2Role}
+
+
+  #
+  # Helper Resources
+  # [SolutionHelperRole, AMIInfoFunction, AMIInfo, SolutionHelper, CreateUniqueID]
+  #
+  SolutionHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: Helper_Permissions
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action:
+            - ec2:DescribeImages
+            Resource: "*"
+
+  AMIInfoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub solutions-${AWS::Region}
+        S3Key: efs-backup/v1.3.1/amilookup.zip
+      Handler: amilookup.handler
+      Runtime: nodejs8.10
+      Timeout: 120
+      Description: EFS Backup - This function is CloudFormation custom lambda resource that
+         looks up the latest AMI ID.
+      Role: !Sub ${SolutionHelperRole.Arn}
+
+  AMIInfo:
+    Type: Custom::AMIInfo
+    Properties:
+      ServiceToken: !GetAtt AMIInfoFunction.Arn
+      Region: !Ref "AWS::Region"
+      Architecture: !FindInMap [Map, !FindInMap [Map, !Ref "AWS::Region", "InstanceSize"], "Arch"]
+
+  SolutionHelper:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: solution-helper.lambda_handler
+      Role: !Sub ${SolutionHelperRole.Arn}
+      Description: EFS Backup - This function is a CloudFormation custom lambda resource that
+        generates UUID for each deployment.
+      Code:
+       S3Bucket: !Sub solutions-${AWS::Region}
+       S3Key: library/solution-helper/v3/solution-helper.zip
+      Runtime: python2.7
+      Timeout: 300
+
+  CreateUniqueID:
+    Type: Custom::LoadLambda
+    Properties:
+      ServiceToken: !Sub ${SolutionHelper.Arn}
+      Region: !Sub ${AWS::Region}
+      CreateUniqueID: 'true'
+
+Outputs:
+  UUID:
+    Description: Anonymous UUID for each stack deployment
+    Value: !Sub ${CreateUniqueID.UUID}
+
+  SNSTopic:
+    Description: Topic for your backup notifications
+    Value: !Sub ${SNSTopic.TopicName}
+
+  SourceEFS:
+    Description: Source EFS provided by user
+    Value: !Sub ${SrcEFS}
+
+  BackupEFS:
+    Description: Backup EFS created by template
+    Value: !Sub ${DstEFS}
+
+  DashboardView:
+    Condition: DashboardOpt
+    Description: CloudWatch Dashboard to view EFS metrics
+    Value: !Sub ${CWDashboard}
+
+  LogBucket:
+    Description: S3 bucket for your backup logs
+    Value: !Sub ${EFSLogBucket}
+
+  AmiId:
+    Description: Ami Id vended in template
+    Value: !GetAtt AMIInfo.Id
