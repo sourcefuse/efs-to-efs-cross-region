@@ -19,7 +19,8 @@ The EFS-to-EFS backup solution leverages Amazon CloudWatch and AWS Lambda to aut
 
 ![Solution Diagram](images/efs.png)
 
-Launch Solution Stack
+# Launch Solution Stack
+
 [![Launch Stack](https://cdn.rawgit.com/buildkite/cloudformation-launch-stack-button-svg/master/launch-stack.svg)](https://console.aws.amazon.com/cloudformation/home#/stacks/new?stackName=connect&templateURL=https://s3.amazonaws.com/aws-solutions-sf/efs-solution/main.yml)
 
 
