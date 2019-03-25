@@ -16,3 +16,8 @@ The EFS-to-EFS backup solution leverages Amazon CloudWatch and AWS Lambda to aut
 •	During the lifecycle hook event, the EC2 instance will stop/cleanup rsync process gracefully and update the DDB table with the KPIs, upload logs to the S3 bucket.
 
 •	The EC2 successful termination trigger another lifecycle hook event. This event triggers the orchestrator lambda function to send the anonymous metrics, notify customer if complete backup was not done.
+
+![Solution Diagram](images/efs.png)
+
+# Original Concept
+The solution is a modification of a AWS Quickstart which solves the problem of EFS to EFS backup. However this solution adds the cross region capability to the solution.
